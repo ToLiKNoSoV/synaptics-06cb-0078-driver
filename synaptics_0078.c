@@ -751,6 +751,45 @@ static void capture_ssm_run(FpiSsm *ssm, FpDevice *dev)
     }
 }
 
+static void detect_minutiae_cb(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+    gpointer *data = (gpointer *)user_data;
+    GMainLoop *loop = (GMainLoop *)data[0];
+    gboolean *detected = (gboolean *)data[1];
+    GError **error = (GError **)data[2];
+    FpImage *img = FP_IMAGE(source);
+
+    fp_dbg("detect_minutiae_cb called");
+
+    GError *local_error = NULL;
+    if (fp_image_detect_minutiae_finish(img, res, &local_error)) {
+        *detected = TRUE;
+        fp_dbg("Minutiae detection successful");
+
+        /* Просто проверяем наличие минуций, не детализируя */
+        GPtrArray *minutiae = fp_image_get_minutiae(img);
+        if (minutiae) {
+            fp_dbg("Found %u minutiae", minutiae->len);
+        }
+
+        if (local_error) {
+            g_error_free(local_error);
+        }
+    } else {
+        fp_dbg("Minutiae detection failed");
+        if (local_error) {
+            fp_dbg("Error: %s", local_error->message);
+            if (error) {
+                *error = local_error;
+            } else {
+                g_error_free(local_error);
+            }
+        }
+    }
+
+    g_main_loop_quit(loop);
+}
+
 static void capture_ssm_complete(FpiSsm *ssm, FpDevice *dev, GError *error)
 {
     FpiDeviceSynaptics0078 *self = FPI_DEVICE_SYNAPTICS_0078(dev);
@@ -821,8 +860,8 @@ static void capture_ssm_complete(FpiSsm *ssm, FpDevice *dev, GError *error)
                     g_printerr("!!! SAVED RAW: %d bytes !!!\n", IMG_SIZE);
                 }
 
-                /* ===== МИНИМАЛЬНАЯ ВЕРСИЯ - БЕЗ ОБРАБОТКИ ===== */
-                fp_dbg("Using raw image data without processing");
+                /* ===== NBIS ВЕРСИЯ - С ДЕТЕКЦИЕЙ МИНУЦИЙ ===== */
+                fp_dbg("Using NBIS minutiae detection");
 
                 /* ДЕТАЛЬНАЯ ОТЛАДКА ДАННЫХ */
                 fp_dbg("=== ДЕТАЛЬНАЯ ОТЛАДКА ДАННЫХ ===");
@@ -832,73 +871,91 @@ static void capture_ssm_complete(FpiSsm *ssm, FpDevice *dev, GError *error)
                 g_printerr("first 4 bytes from image: %02x %02x %02x %02x\n",
                            debug_data[0], debug_data[1], debug_data[2], debug_data[3]);
 
-                /* ===== ИСПРАВЛЕННЫЙ КОД: Создание шаблона в формате RAW ===== */
+                /* ===== NBIS: детекция минуций и создание шаблона ===== */
                 if (current_mode == MODE_ENROLL) {
-                    fp_dbg("MODE_ENROLL: preparing template...");
+                    fp_dbg("MODE_ENROLL: detecting minutiae...");
 
-                    /* Получаем данные изображения */
-                    gsize img_len;
-                    guint8 *img_data = (guint8 *)fp_image_get_data(image, &img_len);
+                    /* Создаем временный main loop для синхронной детекции */
+                    GMainLoop *loop = g_main_loop_new(NULL, FALSE);
+                    gboolean detected = FALSE;
+                    GError *detect_error = NULL;
+                    gpointer cb_data[] = {loop, &detected, &detect_error};
 
-                    if (img_data && img_len > 0) {
-                        g_printerr("✓ Image data size: %zu bytes\n", img_len);
+                    /* Запускаем асинхронную детекцию */
+                    fp_image_detect_minutiae(image, NULL, detect_minutiae_cb, cb_data);
 
-                        /* Создаём шаблон */
-                        print = fp_print_new(dev);
-                        if (print) {
-                            /* Устанавливаем тип RAW (как в официальном драйвере) */
-                            fpi_print_set_type(print, FPI_PRINT_RAW);
+                    /* Ждем завершения */
+                    g_main_loop_run(loop);
+                    g_main_loop_unref(loop);
 
-                            /* Создаём GVariant с данными изображения */
-                            GVariant *img_variant = g_variant_new_fixed_array(
-                                G_VARIANT_TYPE_BYTE,
-                                img_data,
-                                img_len,
-                                1
-                            );
+                    /* Получаем минуции ПОСЛЕ завершения детекции */
+                    GPtrArray *minutiae = fp_image_get_minutiae(image);
 
-                            /* Определяем номер пальца */
-                            FpFinger finger_enum;
-                            if (self->finger_name) {
-                                finger_enum = finger_name_to_enum(self->finger_name);
-                            } else {
-                                finger_enum = FP_FINGER_RIGHT_INDEX;
+                    if (minutiae) {
+                        fp_dbg("Minutiae found: %u", minutiae->len);
+
+                        if (minutiae->len > 0) {
+                            g_printerr("✓ Found %u minutiae\n", minutiae->len);
+
+                            /* Минуции найдены - создаём шаблон */
+                            print = fp_print_new(dev);
+                            if (print) {
+                                /* ВАЖНО: Устанавливаем тип NBIS */
+                                fpi_print_set_type(print, FPI_PRINT_NBIS);
+
+                                GError *nbis_error = NULL;
+
+                                if (!fpi_print_add_from_image(print, image, &nbis_error)) {
+                                    g_printerr("✗ NBIS ERROR: %s\n", nbis_error ? nbis_error->message : "unknown");
+                                    if (nbis_error) {
+                                        g_error_free(nbis_error);
+                                    }
+                                    g_clear_object(&print);
+                                    has_error = TRUE;
+                                } else {
+                                    g_printerr("✓ NBIS: Template created successfully\n");
+
+                                    /* Устанавливаем finger name */
+                                    FpFinger finger_enum;
+                                    if (self->finger_name) {
+                                        finger_enum = finger_name_to_enum(self->finger_name);
+                                    } else {
+                                        finger_enum = FP_FINGER_RIGHT_INDEX;
+                                    }
+                                    fp_print_set_finger(print, finger_enum);
+
+                                    /* Сохраняем отладочную информацию */
+                                    FILE *f_debug = fopen("/run/fingerprint_template_info.txt", "w");
+                                    if (f_debug) {
+                                        fprintf(f_debug, "Template created at: %ld\n", time(NULL));
+                                        fprintf(f_debug, "Minutiae count: %u\n", minutiae->len);
+                                        fclose(f_debug);
+                                    }
+
+                                    g_printerr("\n===========================================\n");
+                                    g_printerr("✅ Шаблон создан в формате NBIS\n");
+                                    g_printerr("📁 Будет сохранён fprintd в /var/lib/fprint/synaptics_0078/\n");
+                                    g_printerr("===========================================\n\n");
+                                }
                             }
-
-                            /* Создаём структуру данных как в официальном драйвере */
-                            /* ИСПОЛЬЗУЕМ ДРУГОЕ ИМЯ - НЕ "data" */
-                            GVariant *print_data = g_variant_new(
-                                "(y@ay)",
-                                                                 finger_enum,      /* номер пальца */
-                                                                 img_variant       /* данные изображения */
-                            );
-
-                            /* Записываем данные в шаблон */
-                            g_object_set(print, "fpi-data", print_data, NULL);
-
-                            /* Устанавливаем finger name */
-                            fp_print_set_finger(print, finger_enum);
-
-                            /* Сохраняем отладочную информацию */
-                            FILE *f_debug = fopen("/run/fingerprint_template_info.txt", "w");
-                            if (f_debug) {
-                                fprintf(f_debug, "Template created at: %ld\n", time(NULL));
-                                fprintf(f_debug, "Image size: %zu bytes\n", img_len);
-                                fprintf(f_debug, "Finger: %d\n", finger_enum);
-                                fclose(f_debug);
+                        } else {
+                            g_printerr("✗ No minutiae found\n");
+                            if (detect_error) {
+                                g_printerr("  - error: %s\n", detect_error->message);
+                                g_error_free(detect_error);
                             }
-
-                            g_printerr("\n===========================================\n");
-                            g_printerr("✅ Шаблон создан в формате RAW\n");
-                            g_printerr("📁 Будет сохранён fprintd в /var/lib/fprint/synaptics_0078/\n");
-                            g_printerr("===========================================\n\n");
+                            has_error = TRUE;
                         }
                     } else {
-                        g_printerr("✗ Failed to get image data\n");
+                        g_printerr("✗ Minutiae array is NULL\n");
+                        if (detect_error) {
+                            g_printerr("  - error: %s\n", detect_error->message);
+                            g_error_free(detect_error);
+                        }
                         has_error = TRUE;
                     }
                 }
-                /* ===== КОНЕЦ ИСПРАВЛЕННОГО КОДА ===== */
+                /* ===== КОНЕЦ NBIS ВЕРСИИ ===== */
 
             } else {
                 fp_dbg("ERROR: Image data invalid - data=%p, len=%zu", data, len);
